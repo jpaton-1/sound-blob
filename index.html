@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>SYNTHESIS // AR voice blob</title>
+<style>
+  :root{ --grn:#3dff6a; --dim:#1d5c2e; --bg:#050705; }
+  *{ box-sizing:border-box; margin:0; }
+  html,body{ height:100%; background:var(--bg); overflow:hidden;
+    font-family:"SFMono-Regular",Menlo,Consolas,monospace; color:var(--grn); }
+  #scene{ position:fixed; inset:0; }
+  #hud{ position:fixed; inset:0; pointer-events:none; display:flex; flex-direction:column; justify-content:space-between; padding:14px; }
+  .top{ display:flex; justify-content:space-between; align-items:flex-start; }
+  .tag{ background:rgba(0,0,0,.55); border:1px solid var(--dim); padding:8px 14px; letter-spacing:2px; }
+  .meta{ text-align:right; font-size:11px; line-height:1.7; opacity:.85; white-space:pre; }
+  .bottom{ pointer-events:auto; }
+  #meterWrap{ height:4px; background:#0a1f0e; margin:0 0 10px 0; border:1px solid var(--dim); }
+  #meter{ height:100%; width:0%; background:var(--grn); box-shadow:0 0 8px var(--grn); transition:width .08s linear; }
+  #log{ font-size:12px; min-height:0; max-height:18vh; overflow:hidden; line-height:1.5; opacity:.9; }
+  #log div::before{ content:"» "; color:var(--dim); }
+  #input{ width:100%; background:rgba(0,0,0,.6); border:1px solid var(--grn); color:var(--grn);
+    padding:12px 14px; font:italic 13px/1.4 inherit; outline:none; caret-color:var(--grn); }
+  #input::placeholder{ color:var(--dim); }
+  #btns{ display:flex; gap:8px; margin-top:8px; }
+  button{ pointer-events:auto; background:rgba(0,20,6,.7); color:var(--grn); border:1px solid var(--grn);
+    font:12px inherit; letter-spacing:1px; padding:8px 12px; }
+  button:active{ background:var(--grn); color:#000; }
+  button[disabled]{ opacity:.4; }
+  #startOverlay{ position:fixed; inset:0; background:var(--bg); display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:18px; z-index:10; pointer-events:auto; }
+  #startOverlay h1{ letter-spacing:6px; font-weight:400; text-shadow:0 0 18px var(--grn); }
+  #startOverlay p{ font-size:11px; opacity:.7; max-width:32ch; text-align:center; line-height:1.8; }
+  #startBtn{ font-size:14px; padding:14px 28px; }
+  .scan{ position:fixed; inset:0; pointer-events:none; z-index:5; opacity:.25;
+    background:repeating-linear-gradient(0deg, transparent 0 2px, rgba(0,0,0,.35) 2px 4px); }
+</style>
+</head>
+<body>
+<div id="scene"></div>
+<div class="scan"></div>
+
+<div id="hud">
+  <div class="top">
+    <div class="tag">SYNTHESIS</div>
+    <div class="meta" id="meta">ACQUIRING FIX…</div>
+  </div>
+  <div class="bottom">
+    <div id="meterWrap"><div id="meter"></div></div>
+    <div id="log"></div>
+    <input id="input" placeholder="Type a message and press enter..." autocomplete="off"/>
+    <div id="btns">
+      <button id="voiceBtn">🎙 VOICE OFF</button>
+      <button id="arBtn" disabled>ENTER AR</button>
+    </div>
+  </div>
+</div>
+
+<div id="startOverlay">
+  <h1>SYNTHESIS</h1>
+  <p>a generative blob, seeded by your location,<br>breathing to your voice<br><br>tap to grant GPS + microphone</p>
+  <button id="startBtn">INITIALIZE</button>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ---------------- deterministic PRNG ---------------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function strSeed(s){let h=1779033703^s.length;for(let i=0;i<s.length;i++){h=Math.imul(h^s.charCodeAt(i),3432918353);h=(h<<13)|(h>>>19);}return h>>>0;}
+
+/* ---------------- GLSL: Ashima 3D simplex noise ---------------- */
+const SNOISE = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g;
+  vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+  i=mod289(i);
+  vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,1.0,2.0,3.0));
+  float n_=0.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*p; vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0; vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 g0=vec3(a0.xy,h.x); vec3 g1=vec3(a0.zw,h.y); vec3 g2=vec3(a1.xy,h.z); vec3 g3=vec3(a1.zw,h.w);
+  vec4 t=max(0.5-vec4(dot(g0,g0),dot(g1,g1),dot(g2,g2),dot(g3,g3)),0.0);
+  t=t*t; t=t*t;
+  vec4 g=vec4(dot(g0,a0),dot(g1,a1),dot(g2,a2),dot(g3,a3));
+  return 105.0*dot(t*t,g);}
+`;
+
+/* ---------------- three setup ---------------- */
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x000000, 1);
+renderer.xr.enabled = true;
+document.getElementById('scene').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.01, 50);
+camera.position.set(0, 0, 2.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const blob = new THREE.Group();
+scene.add(blob);
+
+/* ---------- outer faceted shell ---------- */
+const shellUniforms = {
+  uTime:{value:0}, uAmp:{value:0.35}, uFreq:{value:2.0},
+  uSeed:{value:new THREE.Vector3(0,0,0)},
+  uColor:{value:new THREE.Color(0.72,0.92,0.60)},
+  uLevel:{value:0}, uGlow:{value:0.6}
+};
+const shell = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(1, 5),
+  new THREE.ShaderMaterial({
+    uniforms: shellUniforms, transparent:true, depthWrite:false, side:THREE.DoubleSide,
+    vertexShader:`
+      uniform float uTime,uAmp,uFreq; uniform vec3 uSeed;
+      varying vec3 vW;
+      ${SNOISE}
+      void main(){
+        vec3 n=normalize(position);
+        float d = snoise(n*uFreq + uSeed + uTime*0.15);
+        d += 0.45*snoise(n*uFreq*2.3 + uSeed*1.7 - uTime*0.21);
+        vec3 p = n*(1.0 + d*uAmp);
+        vec4 w = modelMatrix*vec4(p,1.0);
+        vW = w.xyz;
+        gl_Position = projectionMatrix*viewMatrix*w;
+      }`,
+    fragmentShader:`
+      uniform vec3 uColor; uniform float uLevel,uGlow;
+      varying vec3 vW;
+      void main(){
+        vec3 N = normalize(cross(dFdx(vW), dFdy(vW)));
+        vec3 V = normalize(cameraPosition - vW);
+        float fres = pow(1.0 - abs(dot(N,V)), 2.2);
+        float a  = 0.10 + fres*0.9;
+        vec3 col = uColor*(0.35 + uGlow) + vec3(1.0,1.0,0.85)*fres*(0.25+0.75*uLevel);
+        gl_FragColor = vec4(col, a*(0.55+0.45*uLevel));
+      }`
+  })
+);
+shell.renderOrder = 2;
+blob.add(shell);
+
+/* ---------- inner glowing nebula core ---------- */
+const coreUniforms = {
+  uTime:{value:0}, uSeed:{value:new THREE.Vector3(0,0,0)},
+  uColor:{value:new THREE.Color(0.08,0.85,0.30)}, uLevel:{value:0}, uFreq:{value:3.0}
+};
+const core = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(0.92, 3),
+  new THREE.ShaderMaterial({
+    uniforms: coreUniforms, transparent:true, depthWrite:false,
+    blending:THREE.AdditiveBlending, side:THREE.DoubleSide,
+    vertexShader:`
+      uniform float uTime,uFreq; uniform vec3 uSeed;
+      varying vec3 vP;
+      ${SNOISE}
+      void main(){
+        vec3 n=normalize(position);
+        float d = snoise(n*uFreq*0.7 + uSeed + uTime*0.18);
+        vP = n*(0.9 + d*0.18);
+        gl_Position = projectionMatrix*modelViewMatrix*vec4(vP,1.0);
+      }`,
+    fragmentShader:`
+      uniform vec3 uColor; uniform float uLevel,uFreq; uniform vec3 uSeed;
+      varying vec3 vP;
+      ${SNOISE}
+      void main(){
+        float n = snoise(vP*uFreq + uSeed*2.0 + uTime*0.22);
+        float a = smoothstep(-0.1,0.85,n)*(0.28+0.5*uLevel);
+        a *= smoothstep(0.95,0.35,length(vP));
+        gl_FragColor = vec4(uColor*(1.2+1.6*uLevel), a);
+      }`
+  })
+);
+core.renderOrder = 1;
+blob.add(core);
+
+/* ---------------- geolocation -> seed ---------------- */
+const meta = document.getElementById('meta');
+let geo = null;
+
+function applySeed(){
+  const g = geo;
+  if(!g) return;
+  const rng = mulberry32(g.seed);
+  shellUniforms.uFreq.value = 1.6 + rng()*1.4;
+  coreUniforms.uFreq.value  = 2.4 + rng()*1.6;
+  shellUniforms.uSeed.value.set(g.gl*0.618, g.glo*0.618, rng()*100);
+  coreUniforms.uSeed.value.copy(shellUniforms.uSeed.value).multiplyScalar(1.3);
+  const hue = 0.36 + (rng()-0.5)*0.06;          // green, slight per-place variation
+  shellUniforms.uColor.value.setHSL(hue, 0.65, 0.78);
+  coreUniforms.uColor.value.setHSL(hue-0.02, 0.95, 0.45);
+  meta.textContent =
+    `LAT ${g.lat.toFixed(4)}  LON ${g.lon.toFixed(4)}\n` +
+    `GRID ${g.grid}\n` +
+    `SEED ${ (g.seed>>>0).toString(16).toUpperCase() }`;
+}
+
+function acquire(){
+  return new Promise(res=>{
+    if(!navigator.geolocation) return res(null);
+    navigator.geolocation.getCurrentPosition(p=>{
+      const gl=Math.round(p.coords.latitude/0.001),
+            glo=Math.round(p.coords.longitude/0.001);   // ~100 m grid cell
+      res({ lat:p.coords.latitude, lon:p.coords.longitude,
+            gl, glo, grid:`${Math.abs(gl)}·${Math.abs(glo)}`,
+            seed:strSeed(gl+':'+glo) });
+    }, ()=>{
+      meta.textContent = 'GPS DENIED — using random seed\n(no cross-device sync)';
+      const s=(Math.random()*1e9)>>>0;
+      res({ lat:0, lon:0, gl:0, glo:0, grid:'???', seed:s });
+    }, { timeout:8000, maximumAge:120000 });
+  });
+}
+
+/* ---------------- voice ---------------- */
+let audioCtx, analyser, tdata, level=0, voiceOn=false;
+const voiceBtn = document.getElementById('voiceBtn');
+
+async function toggleVoice(){
+  if(voiceOn){ voiceOn=false; voiceBtn.textContent='🎙 VOICE OFF'; return; }
+  try{
+    audioCtx = audioCtx || new (window.AudioContext||window.webkitAudioContext)();
+    await audioCtx.resume();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:{ noiseSuppression:false, echoCancellation:true } });
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
+    src.connect(analyser);
+    tdata = new Uint8Array(analyser.fftSize);
+    voiceOn = true; voiceBtn.textContent = '🎙 VOICE ON';
+    addLog('voice linked');
+  }catch(e){ addLog('mic denied'); }
+}
+voiceBtn.onclick = toggleVoice;
+
+function sampleVoice(){
+  if(!voiceOn || !analyser) { level *= 0.9; return; }
+  analyser.getByteTimeDomainData(tdata);
+  let s=0; for(let i=0;i<tdata.length;i++){ const v=(tdata[i]-128)/128; s+=v*v; }
+  const rms = Math.sqrt(s/tdata.length);
+  const target = Math.min(1, rms*4.5);
+  level = target > level ? level+(target-level)*0.4   // fast attack
+                            : level+(target-level)*0.08; // slow release
+}
+
+/* ---------------- message input (matches reference UI) ---------------- */
+const input = document.getElementById('input');
+const log = document.getElementById('log');
+function addLog(t){
+  const d=document.createElement('div'); d.textContent=t;
+  log.appendChild(d); while(log.children.length>6) log.firstChild.remove();
+}
+input.addEventListener('keydown', e=>{
+  if(e.key!=='Enter' || !input.value.trim()) return;
+  addLog(input.value.trim());
+  input.value='';
+  pulse = 1;                                   // kick the blob
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.98,1.02,64),
+    new THREE.MeshBasicMaterial({ color:0x3dff6a, transparent:true, opacity:0.8,
+      blending:THREE.AdditiveBlending, side:THREE.DoubleSide, depthWrite:false }));
+  ring.lookAt(camera.position); blob.add(ring);
+  pulses.push({ m:ring, t:0 });
+});
+let pulse = 0; const pulses = [];
+
+/* ---------------- WebAR ---------------- */
+const arBtn = document.getElementById('arBtn');
+let hitSource=null, reticle=null, inAR=false;
+
+if(navigator.xr) navigator.xr.isSessionSupported('immersive-ar')
+  .then(ok=>{ arBtn.disabled=!ok; if(ok) addLog('webar ready'); else meta.textContent+='\nAR: unsupported here — 3D preview'; })
+  .catch(()=>{ arBtn.disabled=true; });
+
+arBtn.onclick = async ()=>{
+  try{
+    const session = await navigator.xr.requestSession('immersive-ar',{
+      optionalFeatures:['hit-test','dom-overlay'],
+      domOverlay:{ root:document.getElementById('hud') }
+    });
+    inAR = true;
+    renderer.setClearColor(0x000000, 0);          // show passthrough
+    blob.position.set(0, -0.2, -1.2);
+    reticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.06,0.08,32).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({ color:0x3dff6a }));
+    reticle.matrixAutoUpdate=false; scene.add(reticle);
+    const viewer = await session.requestReferenceSpace('viewer');
+    hitSource = await session.requestHitTestSource({ space:viewer });
+    session.addEventListener('select', ()=>{
+      if(reticle.visible){
+        blob.position.setFromMatrixPosition(reticle.matrix);
+        addLog('re-anchored');
+      }
+    });
+    session.addEventListener('end', ()=>{
+      inAR=false; hitSource=null; reticle=null;
+      renderer.setClearColor(0x000000,1);
+      blob.position.set(0,0,0); camera.position.set(0,0,2.4);
+    });
+    await renderer.xr.setSession(session);
+  }catch(e){ addLog('ar failed: '+e.message); }
+};
+
+/* ---------------- start flow ---------------- */
+document.getElementById('startBtn').onclick = async ()=>{
+  document.getElementById('startOverlay').style.display='none';
+  geo = await acquire();
+  applySeed();
+  addLog('seeded @ grid ' + geo.grid);
+  try{ await toggleVoice(); }catch(e){}
+};
+
+/* ---------------- main loop ---------------- */
+const meter = document.getElementById('meter');
+let last = performance.now();
+renderer.setAnimationLoop(()=>{
+  const now = performance.now();
+  const dt = Math.min(0.05,(now-last)/1000); last = now;
+
+  // wall-clock time => all devices in the same grid sample the same field
+  shellUniforms.uTime.value = coreUniforms.uTime.value = (Date.now()/1000) % 10000;
+
+  sampleVoice();
+  pulse *= Math.exp(-dt*2.2);
+
+  const amp = 0.28 + level*0.55 + pulse*0.6;
+  shellUniforms.uAmp.value  = amp;
+  shellUniforms.uLevel.value= level + pulse*0.8;
+  shellUniforms.uGlow.value = 0.55 + level*1.1 + pulse*0.6;
+  coreUniforms.uLevel.value = level + pulse*0.8;
+
+  const s = 1 + level*0.22 + pulse*0.25;
+  blob.scale.setScalar(s);
+  blob.rotation.y += dt*(0.25 + level*1.4);
+  blob.rotation.x = Math.sin(now*0.0003)*0.15;
+
+  for(let i=pulses.length-1;i>=0;i--){
+    const p=pulses[i]; p.t+=dt;
+    p.m.scale.setScalar(1+p.t*1.8);
+    p.m.material.opacity = 0.8*(1-p.t/1.4);
+    p.m.lookAt(camera.position);
+    if(p.t>1.4){ blob.remove(p.m); pulses.splice(i,1); }
+  }
+
+  if(inAR && hitSource && renderer.xr.isPresenting){
+    const frame = renderer.xr.getFrame();
+    const hits = frame.getHitTestResults(hitSource);
+    if(hits.length){
+      const pose = hits[0].getPose(renderer.xr.getReferenceSpace());
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+    } else reticle.visible = false;
+  }
+
+  meter.style.width = (Math.min(1, level*1.3)*100).toFixed(1)+'%';
+  if(!inAR) controls.update();
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
